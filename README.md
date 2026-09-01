@@ -1,4 +1,4 @@
-# unauth_rfm_enumeration
+# SAP RFM enumeration tool
 
 Find remote function modules (RFMs) an AS ABAP will run **without authentication**, built
 on [pysap](https://github.com/OWASP/pysap) — no NetWeaver RFC SDK, no SAP GUI, no
