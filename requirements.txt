@@ -1,0 +1,2 @@
+# The only dependency; it pulls in scapy.
+pysap
