@@ -621,6 +621,44 @@ VERDICT_MARK = {
 }
 
 
+def print_reply(fn, reply):
+    """Show a single probe's decoded reply in full.
+
+    RFC_SYSTEM_INFO has a known fixed-width record, so its fields are named. For any other
+    module the reply values are dumped as-is -- one line per value, rendered as text when
+    they decode cleanly (they are UTF-16LE once the session went Unicode) and as hex
+    otherwise. No per-function parameter model is built; this is the raw answer the kernel
+    gave, made readable.
+
+    Every reply first echoes the connect-accept block (the session parameters, ending with
+    the 0x0514 nonce the client sent); the function's own output follows it. That preamble
+    is dropped so what prints is the module's return data, not our own connect echoed back.
+    """
+    print("\n[*] %s (unauthenticated):" % fn)
+    if fn == "RFC_SYSTEM_INFO":
+        record = max((v for _, v in reply.values), key=len, default=b"")
+        info = parse_rfcsi(record)
+        for key in ("RFCSYSID", "RFCDATABS", "RFCDBSYS", "RFCSAPRL", "RFCKERNRL",
+                    "RFCOPSYS", "RFCMACH", "RFCHOST", "RFCIPADDR", "RFCDEST"):
+            if info.get(key):
+                print("      %-11s %s" % (key, info[key]))
+        return
+    tags = [t for t, _ in reply.values]
+    start = tags.index(TAG_NONCE) + 1 if TAG_NONCE in tags else 0
+    values = [(t, txt) for t, txt in reply.text_values()[start:] if txt]
+    if not values:
+        print("      (dispatched, no data returned)")
+        return
+    for tag, text in values:
+        # Keep long values on their own indented block so the column stays aligned.
+        if len(text) <= 60 and "\n" not in text:
+            print("      0x%04x  %s" % (tag, text))
+        else:
+            print("      0x%04x" % tag)
+            for line in text.splitlines() or [text]:
+                print("        %s" % line)
+
+
 def load_candidates(path):
     with open(path) as fh:
         return [ln.strip() for ln in fh
@@ -746,6 +784,7 @@ def main(argv=None):
 
     unauth = []
     sysinfo = None
+    single = None  # the one reply, when exactly one module was probed
     report = open(args.report, "w") if args.report else None
     progress = Progress(len(candidates), enabled=not args.no_progress)
 
@@ -760,7 +799,9 @@ def main(argv=None):
         report.write(json.dumps(row) + "\n")
 
     def handle(fn, reply):
-        nonlocal sysinfo
+        nonlocal sysinfo, single
+        if len(candidates) == 1:
+            single = reply
         hit = not isinstance(reply, Exception) and reply.unauthenticated
         progress.clear()
         if isinstance(reply, RFCProbeError):
@@ -799,15 +840,14 @@ def main(argv=None):
     if report is not None:
         print("[*] report written to %s" % args.report)
 
-    if sysinfo is not None:
-        # The RFCSI record is the one long character value in the reply.
-        rfcsi_record = max((v for _, v in sysinfo.values), key=len, default=b"")
-        info = parse_rfcsi(rfcsi_record)
-        print("\n[*] RFC_SYSTEM_INFO (unauthenticated):")
-        for key in ("RFCSYSID", "RFCDATABS", "RFCDBSYS", "RFCSAPRL", "RFCKERNRL",
-                    "RFCOPSYS", "RFCMACH", "RFCHOST", "RFCIPADDR", "RFCDEST"):
-            if info.get(key):
-                print("      %-11s %s" % (key, info[key]))
+    # A single probed module: show its full decoded reply, whatever it was.
+    if len(candidates) == 1 and single is not None \
+            and not isinstance(single, Exception) and single.unauthenticated:
+        print_reply(candidates[0], single)
+    # A sweep that happened to include RFC_SYSTEM_INFO: still surface the system details
+    # (unless it was already printed above as the single module).
+    elif sysinfo is not None:
+        print_reply("RFC_SYSTEM_INFO", sysinfo)
     return 0
 
 

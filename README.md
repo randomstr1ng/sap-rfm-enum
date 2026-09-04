@@ -35,7 +35,22 @@ python3 -m venv .venv && ./.venv/bin/pip install pysap
 ./.venv/bin/python rfm_enum.py <host> --route "/H/router/S/3299/H/target"
 ```
 
-Against a lab AS ABAP (kernel 793, gateway on 3300):
+When exactly one module is probed (`-f NAME`, or a one-line wordlist) and it answers
+unauthenticated, its decoded reply is printed in full — the connect-accept echo is stripped
+so what shows is the module's own return data:
+
+```
+./.venv/bin/python rfm_enum.py <host> -f RFC_GET_LOCAL_SERVERS
+
+[*] RFC_GET_LOCAL_SERVERS (unauthenticated):
+      0x0301  HOSTS
+      0x0304
+        vhcala4hci_A4H_00     vhcala4hci     sapdp00 ...
+```
+
+`RFC_SYSTEM_INFO` is decoded into its named RFCSI fields; every other module's values are
+dumped as text (hex when they do not decode). Against a lab AS ABAP (kernel 793, gateway on
+3300):
 
 ```
 [*] 3 of 16 callable unauthenticated: RFC_PING, RFC_SYSTEM_INFO, SYSTEM_INVISIBLE_GUI
