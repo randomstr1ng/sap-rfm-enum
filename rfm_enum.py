@@ -30,6 +30,7 @@ Everything lives in this one file, in three layers bottom-up:
 Authorized security testing only.
 """
 import argparse
+import getpass
 import json
 import socket
 import struct
@@ -40,6 +41,7 @@ from scapy.packet import Raw
 
 from pysap.SAPRFC import SAPRFC
 from pysap.SAPRouter import SAPRoutedStreamSocket
+from pysap.utils.crypto.rfc import ab_scramble
 
 
 # =============================================================================
@@ -88,6 +90,8 @@ TAG_PROGRAM = 0x0130      # "rfccall"
 TAG_UNKNOWN_0502 = 0x0502
 TAG_REL3 = 0x000b
 TAG_FUNCTION = 0x0102     # "RFCPING"        -- the function module to dispatch
+TAG_MESSAGE = 0x0402      # a system message the kernel injects instead of running the call
+                          # (e.g. "Name or password is incorrect", an authorization refusal)
 
 #: Order matters: the kernel parses the chain positionally in places.
 CONNECT_ORDER = [TAG_FLAGS1, TAG_FLAGS2, TAG_FLAGS3, TAG_NONCE, TAG_CLIENT, TAG_USER,
@@ -190,15 +194,18 @@ def build_connect(function, user=None, passwd=None, client="001", lang="E",
 
 
 def scramble_password(passwd):
-    """Placeholder for the 0x0117 obfuscation -- deliberately not implemented.
+    """Obfuscate a password for the 0x0117 field.
 
-    Enumerating unauthenticated function modules never sends a password: the whole point is
-    the anonymous connect. Callers that pass `passwd` get a clear failure rather than a
-    silently wrong 17-byte blob.
+    The RFC layer wraps the password in SAP's reversible "ab_scramble" XOR scheme --
+    `[4-byte LE seed][scrambled bytes]`. pysap ships the algorithm; the NetWeaver RFC SDK
+    encodes the plaintext as UTF-16LE before scrambling, which is the client this tool's
+    connect imitates, so that is the encoding used here.
+
+    This is obfuscation, not encryption: anyone on the wire can reverse it. It exists only
+    for the *authenticated* scan (which function modules a given user may call); the default
+    anonymous scan never sends a password.
     """
-    raise NotImplementedError(
-        "0x0117 password scrambling is not implemented; this tool probes the anonymous "
-        "connect path only. Use the NetWeaver RFC SDK for authenticated calls.")
+    return ab_scramble(passwd, encoding="utf-16-le")
 
 
 def iter_until_unprintable(text):
@@ -439,6 +446,11 @@ class Reply(object):
     def unauthenticated(self):
         return self.verdict == "unauthenticated"
 
+    @property
+    def has_data(self):
+        """The module was dispatched and answered -- callable in the current mode."""
+        return self.verdict in ("unauthenticated", "authorized")
+
     def text_values(self):
         return [(tag, as_text(v)) for tag, v in self.values]
 
@@ -464,6 +476,12 @@ class Reply(object):
 #: Kernel error numbers that mean "the function was never dispatched, log on first".
 LOGON_ERRORS = {"00024"}
 
+#: Kernel error numbers that, on an authenticated connect, mean the logon succeeded but the
+#: user lacks the S_RFC authorization for the module's function group. Populate from a live
+#: capture against the target -- the exact number is kernel/release dependent, so an
+#: unrecognised error is reported verbatim (as "rejected") rather than mislabelled.
+NOAUTH_ERRORS = set()
+
 
 class RFCClient(object):
     """Drives one probe per connection.
@@ -473,7 +491,8 @@ class RFCClient(object):
     """
 
     def __init__(self, host, port=3300, route=None, timeout=5,
-                 client="001", lang="E", program="pysap", hostname=None, sysnr=None):
+                 client="001", lang="E", program="pysap", hostname=None, sysnr=None,
+                 user=None, passwd=None):
         self.host = host
         self.port = port
         self.route = route
@@ -481,6 +500,10 @@ class RFCClient(object):
         self.client = client
         self.lang = lang
         self.program = program
+        # When set, probes carry credentials and the scan reports what this user may call
+        # rather than what an anonymous caller may.
+        self.user = user
+        self.passwd = passwd
         self.hostname = hostname or socket.gethostname()
         # Dispatcher service name to route to, derived from the port when not given
         # (3300 -> sapdp00). The gateway normalises it, so an approximate value is fine.
@@ -569,9 +592,16 @@ class RFCClient(object):
         return self
 
     def probe(self, function):
-        """Send the anonymous connect naming `function` and classify the reply."""
+        """Send the connect naming `function` and classify the reply.
+
+        Anonymous (no credentials): the reply says whether the module is callable pre-logon.
+        Authenticated (`user`/`passwd` set): the connect logs on first, so the reply says
+        whether this user is *authorized* to call the module -- a dispatched answer means
+        the S_RFC check passed, a kernel error means it did not (or the module is unknown).
+        """
         payload = build_connect(
-            function, client=self.client, lang=self.lang,
+            function, user=self.user, passwd=self.passwd,
+            client=self.client, lang=self.lang,
             hostname=self.hostname, program=self.program, local_ip=self._local_ip())
         self._send(sap_send(self.conv_id, payload))
 
@@ -585,11 +615,45 @@ class RFCClient(object):
             if not body:
                 continue
             kind, detail = decode_reply(body)
-            if kind == "error":
-                verdict = "logon_required" if detail.code in LOGON_ERRORS else "rejected"
-                return Reply(verdict, detail.code, detail.message, raw=body)
-            return Reply("unauthenticated", values=detail, raw=body)
+            if kind == "data":
+                return self._classify_data(detail, body)
+            return Reply(self._classify_error(detail.code),
+                         detail.code, detail.message, raw=body)
         return Reply("no_reply")
+
+    def _classify_data(self, tlvs, body):
+        """Classify a TLV data reply.
+
+        Anonymously, a data reply always means the module ran pre-logon. With credentials
+        the connect logs on first, and the kernel signals a *failed* logon or authorization
+        the same way -- as a data reply carrying a 0x0402 system message rather than the
+        FREE error record -- so the message, not merely the presence of data, is the oracle.
+        """
+        if not self.user:
+            return Reply("unauthenticated", values=tlvs, raw=body)
+        msg = next((as_text(v) for t, v in tlvs if t == TAG_MESSAGE), None)
+        if msg is None:
+            # No system message injected: the logon and the S_RFC check both passed and the
+            # module actually ran.
+            return Reply("authorized", values=tlvs, raw=body)
+        low = msg.lower()
+        if "password" in low or "repeat logon" in low or "incorrect" in low:
+            verdict = "logon_failed"
+        elif "author" in low:
+            verdict = "not_authorized"
+        else:
+            verdict = "rejected"
+        return Reply(verdict, message=msg, values=tlvs, raw=body)
+
+    def _classify_error(self, code):
+        """Turn a FREE-record kernel error number into a verdict, mode-aware."""
+        if code in LOGON_ERRORS:
+            # 00024 = "log on first". Anonymously that is the normal "not callable
+            # pre-logon" answer; with credentials it means the logon itself failed.
+            return "logon_failed" if self.user else "logon_required"
+        if self.user and code in NOAUTH_ERRORS:
+            return "not_authorized"
+        return "rejected"
 
 
 def probe_function(host, function, port=3300, route=None, timeout=5, **kw):
@@ -615,7 +679,10 @@ DEFAULT_CANDIDATES = [
 
 VERDICT_MARK = {
     "unauthenticated": "\033[1;31m[UNAUTH]\033[0m",
+    "authorized": "\033[1;32m[AUTHZD]\033[0m",
+    "not_authorized": "\033[0;34m[noauth]\033[0m",
     "logon_required": "\033[0;34m[logon ]\033[0m",
+    "logon_failed": "\033[1;35m[LOGON!]\033[0m",
     "rejected": "\033[0;33m[reject]\033[0m",
     "no_reply": "\033[0;90m[silent]\033[0m",
 }
@@ -634,7 +701,8 @@ def print_reply(fn, reply):
     the 0x0514 nonce the client sent); the function's own output follows it. That preamble
     is dropped so what prints is the module's return data, not our own connect echoed back.
     """
-    print("\n[*] %s (unauthenticated):" % fn)
+    label = "authorized" if reply.verdict == "authorized" else "unauthenticated"
+    print("\n[*] %s (%s):" % (fn, label))
     if fn == "RFC_SYSTEM_INFO":
         record = max((v for _, v in reply.values), key=len, default=b"")
         info = parse_rfcsi(record)
@@ -710,7 +778,7 @@ class Progress(object):
         elapsed = now - self._start
         rate = self.done / elapsed if elapsed else 0
         eta = (self.total - self.done) / rate if rate else 0
-        line = "  [%d/%d] %.0f%%  unauth=%d  %.0f/s  ETA %s" % (
+        line = "  [%d/%d] %.0f%%  hits=%d  %.0f/s  ETA %s" % (
             self.done, self.total, 100.0 * self.done / self.total,
             self.hits, rate, _hms(eta))
         self._width = max(self._width, len(line))
@@ -734,6 +802,11 @@ def parse_args(argv):
                          "(default: a built-in candidate list)")
     ap.add_argument("-f", "--function", action="append", metavar="FM",
                     help="test one function module (repeatable)")
+    ap.add_argument("-u", "--user",
+                    help="log on as this user and report which modules the user may call "
+                         "(authenticated scan); default is an anonymous scan")
+    ap.add_argument("-P", "--passwd",
+                    help="password for --user; if omitted you are prompted (not echoed)")
     ap.add_argument("-c", "--client", default="001", help="SAP client [%(default)s]")
     ap.add_argument("-l", "--lang", default="E", help="logon language [%(default)s]")
     ap.add_argument("--program", default="pysap",
@@ -768,21 +841,44 @@ def main(argv=None):
     else:
         candidates = DEFAULT_CANDIDATES
 
-    print("[*] target %s:%d  client=%s  %d function module(s)  threads=%d" %
-          (args.host, args.port, args.client, len(candidates), args.threads))
+    # Authenticated scan: a username turns every probe into a real logon, so the results
+    # report what that user is authorized to call. Prompt for the password if not supplied
+    # rather than forcing it onto the command line (and into shell history).
+    passwd = args.passwd
+    if args.user and passwd is None:
+        passwd = getpass.getpass("password for %s: " % args.user)
+
+    mode = "authenticated as %s" % args.user if args.user else "anonymous"
+    print("[*] target %s:%d  client=%s  %s  %d function module(s)  threads=%d" %
+          (args.host, args.port, args.client, mode, len(candidates), args.threads))
 
     def probe_one(fn):
         """Run one probe on its own connection; return (fn, reply_or_exception)."""
         try:
             with RFCClient(args.host, args.port, args.route, args.timeout,
-                           client=args.client, lang=args.lang,
-                           program=args.program) as c:
+                           client=args.client, lang=args.lang, program=args.program,
+                           user=args.user, passwd=passwd) as c:
                 c.connect()
                 return fn, c.probe(fn)
         except (RFCProbeError, OSError) as e:
             return fn, e
 
-    unauth = []
+    # Safety preflight for an authenticated scan: one real logon per probe means a wrong
+    # password sprayed across a wordlist is thousands of failed logons -- enough to lock the
+    # account and trip security alerting. Verify the credentials once, against a module that
+    # requires logon, and abort the whole run if the logon fails.
+    if args.user:
+        _, check = probe_one("STFC_CONNECTION")
+        if isinstance(check, Exception):
+            print("[!] preflight failed: %s" % check)
+            return 2
+        if check.verdict == "logon_failed":
+            print("[!] logon failed for %s: %s" % (args.user, check.message))
+            print("[!] aborting before the scan -- repeated bad logons lock the account")
+            return 2
+        print("[*] logon ok for %s; scanning authorizations" % args.user)
+
+    callable_ = []
     sysinfo = None
     single = None  # the one reply, when exactly one module was probed
     report = open(args.report, "w") if args.report else None
@@ -802,7 +898,7 @@ def main(argv=None):
         nonlocal sysinfo, single
         if len(candidates) == 1:
             single = reply
-        hit = not isinstance(reply, Exception) and reply.unauthenticated
+        hit = not isinstance(reply, Exception) and reply.has_data
         progress.clear()
         if isinstance(reply, RFCProbeError):
             if args.all:
@@ -810,13 +906,13 @@ def main(argv=None):
         elif isinstance(reply, OSError):
             print("[!] %s: %s" % (fn, reply))
         else:
-            if reply.unauthenticated:
-                unauth.append(fn)
+            if reply.has_data:
+                callable_.append(fn)
                 if fn == "RFC_SYSTEM_INFO":
                     sysinfo = reply
-            if reply.unauthenticated or args.all:
-                print("    %-32s %s %s" % (fn, VERDICT_MARK[reply.verdict],
-                                           reply.code or ""))
+            if reply.has_data or args.all:
+                note = reply.code or reply.message or ""
+                print("    %-32s %s %s" % (fn, VERDICT_MARK[reply.verdict], note))
         write_report(fn, reply)
         progress.advance(hit)
 
@@ -835,14 +931,15 @@ def main(argv=None):
         if report is not None:
             report.close()
 
-    print("\n[*] %d of %d callable unauthenticated: %s" %
-          (len(unauth), len(candidates), ", ".join(unauth) or "(none)"))
+    what = ("callable as %s" % args.user) if args.user else "callable unauthenticated"
+    print("\n[*] %d of %d %s: %s" %
+          (len(callable_), len(candidates), what, ", ".join(callable_) or "(none)"))
     if report is not None:
         print("[*] report written to %s" % args.report)
 
     # A single probed module: show its full decoded reply, whatever it was.
     if len(candidates) == 1 and single is not None \
-            and not isinstance(single, Exception) and single.unauthenticated:
+            and not isinstance(single, Exception) and single.has_data:
         print_reply(candidates[0], single)
     # A sweep that happened to include RFC_SYSTEM_INFO: still surface the system details
     # (unless it was already printed above as the single module).

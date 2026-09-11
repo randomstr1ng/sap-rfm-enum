@@ -33,7 +33,26 @@ python3 -m venv .venv && ./.venv/bin/pip install pysap
 ./.venv/bin/python rfm_enum.py <host> -w wordlists/rfm_all.txt -T 16 -o scan.jsonl
 ./.venv/bin/python rfm_enum.py <host> -f RFC_PING -f RFC_SYSTEM_INFO
 ./.venv/bin/python rfm_enum.py <host> --route "/H/router/S/3299/H/target"
+./.venv/bin/python rfm_enum.py <host> -u DEVELOPER -w wordlists/rfm_all.txt   # authenticated
 ```
+
+## Authenticated scan
+
+The default scan is anonymous. Give `-u/--user` (and `-P/--passwd`, or be prompted) and the
+tool logs on for each probe, so the results say which modules **that user is authorized to
+call** — an S_RFC authorization map for the account. The password is obfuscated on the wire
+with pysap's `ab_scramble` (the reversible XOR scheme the NetWeaver RFC SDK uses; this tool
+imitates that client, so UTF-16LE encoding).
+
+Verdicts in this mode: `[AUTHZD]` the call ran (logon + S_RFC both passed), `[noauth]` the
+logon succeeded but the user lacks S_RFC for that function group, `[LOGON!]` the logon
+itself failed.
+
+> **Lockout warning.** Each probe is a real logon. A wrong password across a wordlist is
+> thousands of failed logons — enough to lock the account and trip security alerting. The
+> tool runs a single preflight logon first and **aborts the whole scan if it fails**, so a
+> bad password costs one failed logon, not thousands. Only run authenticated scans against
+> systems you are authorized to test.
 
 When exactly one module is probed (`-f NAME`, or a one-line wordlist) and it answers
 unauthenticated, its decoded reply is printed in full — the connect-accept echo is stripped
@@ -102,11 +121,14 @@ first. Point `-w` at any file in the same format.
 
 ## Scope / limits
 
-- Anonymous connect only. Password scrambling (TLV `0x0117`) is deliberately not
-  implemented — authenticated calls are the NW RFC SDK's job.
-- Reply parsing covers the two verdicts that matter (dispatched vs. logon-required) and the
-  `RFC_SYSTEM_INFO` result record. Full parameter/ITAB deserialisation for arbitrary
-  functions is not implemented.
+- Anonymous by default; `-u` adds an authenticated scan using pysap's `ab_scramble` for the
+  `0x0117` password field. The anonymous path is fully verified against the lab. The
+  authenticated path is verified end-to-end for logon success/failure detection; the
+  `[noauth]` (S_RFC-denied) verdict keys on the kernel message text and has not yet been
+  confirmed against a live authorization refusal — treat that one label as provisional.
+- Reply parsing covers the verdicts that matter (dispatched / logon-required / logon-failed
+  / not-authorized) and the `RFC_SYSTEM_INFO` result record. Full parameter/ITAB
+  deserialisation for arbitrary functions is not implemented.
 - The 80-byte APPC header constants were derived against kernel 7.93; other kernels may
   differ.
 
