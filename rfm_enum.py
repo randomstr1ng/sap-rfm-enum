@@ -149,8 +149,8 @@ def nonce(now=None):
         struct.pack("!I", (t * 2654435761) & 0xffffffff) + b"\x00\x05\x14\x00"[:4]
 
 
-def build_connect(function, user=None, passwd=None, client="001", lang="E",
-                  hostname="localhost", program="pysap", local_ip="127.0.0.1",
+def build_connect(function, user=None, passwd=None, passwd_encoding="ascii", client="001",
+                  lang="E", hostname="localhost", program="pysap", local_ip="127.0.0.1",
                   local_ip6="::1", release="793", os_name="<unknown>"):
     """Build the CPIC connect payload that carries the function module to dispatch.
 
@@ -182,7 +182,7 @@ def build_connect(function, user=None, passwd=None, client="001", lang="E",
     if user is not None:
         values[TAG_USER] = user
     if passwd is not None:
-        values[TAG_PASSWD] = scramble_password(passwd)
+        values[TAG_PASSWD] = scramble_password(passwd, passwd_encoding)
 
     body = b"".join(tlv(t, values[t]) for t in CONNECT_ORDER if t in values)
     # The chain is closed by an empty element carrying the terminator tag.
@@ -193,19 +193,20 @@ def build_connect(function, user=None, passwd=None, client="001", lang="E",
     return payload + struct.pack("!I", len(payload)) + b"\x00\x00\x85\x00"
 
 
-def scramble_password(passwd):
+def scramble_password(passwd, encoding="ascii"):
     """Obfuscate a password for the 0x0117 field.
 
     The RFC layer wraps the password in SAP's reversible "ab_scramble" XOR scheme --
-    `[4-byte LE seed][scrambled bytes]`. pysap ships the algorithm; the NetWeaver RFC SDK
-    encodes the plaintext as UTF-16LE before scrambling, which is the client this tool's
-    connect imitates, so that is the encoding used here.
+    `[4-byte LE seed][scrambled bytes]`. pysap ships the algorithm. The plaintext is encoded
+    before scrambling in one of two ways, and the kernel expects whichever matches the
+    connection codepage: ASCII on a non-Unicode connection (which is what this tool's connect
+    declares -- codepage 1100), UTF-16LE on a Unicode one (the NetWeaver RFC SDK default).
 
     This is obfuscation, not encryption: anyone on the wire can reverse it. It exists only
     for the *authenticated* scan (which function modules a given user may call); the default
     anonymous scan never sends a password.
     """
-    return ab_scramble(passwd, encoding="utf-16-le")
+    return ab_scramble(passwd, encoding=encoding)
 
 
 def iter_until_unprintable(text):
@@ -492,7 +493,7 @@ class RFCClient(object):
 
     def __init__(self, host, port=3300, route=None, timeout=5,
                  client="001", lang="E", program="pysap", hostname=None, sysnr=None,
-                 user=None, passwd=None):
+                 user=None, passwd=None, passwd_encoding="ascii"):
         self.host = host
         self.port = port
         self.route = route
@@ -504,6 +505,7 @@ class RFCClient(object):
         # rather than what an anonymous caller may.
         self.user = user
         self.passwd = passwd
+        self.passwd_encoding = passwd_encoding
         self.hostname = hostname or socket.gethostname()
         # Dispatcher service name to route to, derived from the port when not given
         # (3300 -> sapdp00). The gateway normalises it, so an approximate value is fine.
@@ -601,6 +603,7 @@ class RFCClient(object):
         """
         payload = build_connect(
             function, user=self.user, passwd=self.passwd,
+            passwd_encoding=self.passwd_encoding,
             client=self.client, lang=self.lang,
             hostname=self.hostname, program=self.program, local_ip=self._local_ip())
         self._send(sap_send(self.conv_id, payload))
@@ -639,8 +642,10 @@ class RFCClient(object):
         low = msg.lower()
         if "password" in low or "repeat logon" in low or "incorrect" in low:
             verdict = "logon_failed"
-        elif "author" in low:
+        elif "author" in low:                     # "No RFC authorization for ..."
             verdict = "not_authorized"
+        elif "not found" in low or "does not exist" in low:
+            verdict = "not_found"                 # e.g. "Function module X not found."
         else:
             verdict = "rejected"
         return Reply(verdict, message=msg, values=tlvs, raw=body)
@@ -681,6 +686,7 @@ VERDICT_MARK = {
     "unauthenticated": "\033[1;31m[UNAUTH]\033[0m",
     "authorized": "\033[1;32m[AUTHZD]\033[0m",
     "not_authorized": "\033[0;34m[noauth]\033[0m",
+    "not_found": "\033[0;90m[404   ]\033[0m",
     "logon_required": "\033[0;34m[logon ]\033[0m",
     "logon_failed": "\033[1;35m[LOGON!]\033[0m",
     "rejected": "\033[0;33m[reject]\033[0m",
@@ -807,6 +813,9 @@ def parse_args(argv):
                          "(authenticated scan); default is an anonymous scan")
     ap.add_argument("-P", "--passwd",
                     help="password for --user; if omitted you are prompted (not echoed)")
+    ap.add_argument("--passwd-encoding", choices=("ascii", "utf-16-le"), default="ascii",
+                    help="how the password is encoded before ab_scramble; ascii matches "
+                         "this tool's non-Unicode connect [%(default)s]")
     ap.add_argument("-c", "--client", default="001", help="SAP client [%(default)s]")
     ap.add_argument("-l", "--lang", default="E", help="logon language [%(default)s]")
     ap.add_argument("--program", default="pysap",
@@ -857,7 +866,8 @@ def main(argv=None):
         try:
             with RFCClient(args.host, args.port, args.route, args.timeout,
                            client=args.client, lang=args.lang, program=args.program,
-                           user=args.user, passwd=passwd) as c:
+                           user=args.user, passwd=passwd,
+                           passwd_encoding=args.passwd_encoding) as c:
                 c.connect()
                 return fn, c.probe(fn)
         except (RFCProbeError, OSError) as e:

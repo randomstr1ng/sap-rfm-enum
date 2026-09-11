@@ -41,12 +41,13 @@ python3 -m venv .venv && ./.venv/bin/pip install pysap
 The default scan is anonymous. Give `-u/--user` (and `-P/--passwd`, or be prompted) and the
 tool logs on for each probe, so the results say which modules **that user is authorized to
 call** — an S_RFC authorization map for the account. The password is obfuscated on the wire
-with pysap's `ab_scramble` (the reversible XOR scheme the NetWeaver RFC SDK uses; this tool
-imitates that client, so UTF-16LE encoding).
+with pysap's `ab_scramble` (a reversible XOR scheme). The plaintext is encoded first as
+ASCII, which matches this tool's non-Unicode (codepage 1100) connect; `--passwd-encoding
+utf-16-le` selects the Unicode variant the NetWeaver RFC SDK uses if a system needs it.
 
 Verdicts in this mode: `[AUTHZD]` the call ran (logon + S_RFC both passed), `[noauth]` the
-logon succeeded but the user lacks S_RFC for that function group, `[LOGON!]` the logon
-itself failed.
+logon succeeded but the user lacks S_RFC authorization for the module, `[404]` the module
+does not exist on the system, `[LOGON!]` the logon itself failed.
 
 > **Lockout warning.** Each probe is a real logon. A wrong password across a wordlist is
 > thousands of failed logons — enough to lock the account and trip security alerting. The
@@ -122,13 +123,13 @@ first. Point `-w` at any file in the same format.
 ## Scope / limits
 
 - Anonymous by default; `-u` adds an authenticated scan using pysap's `ab_scramble` for the
-  `0x0117` password field. The anonymous path is fully verified against the lab. The
-  authenticated path is verified end-to-end for logon success/failure detection; the
-  `[noauth]` (S_RFC-denied) verdict keys on the kernel message text and has not yet been
-  confirmed against a live authorization refusal — treat that one label as provisional.
-- Reply parsing covers the verdicts that matter (dispatched / logon-required / logon-failed
-  / not-authorized) and the `RFC_SYSTEM_INFO` result record. Full parameter/ITAB
-  deserialisation for arbitrary functions is not implemented.
+  `0x0117` password field. All verdicts verified live against the lab: anonymous scan,
+  `authorized`, `not_authorized` (against a service user with no S_RFC — the kernel returns
+  "No RFC authorization for function module X"), `logon_failed`, `not_found`, and the
+  preflight abort.
+- Reply parsing covers the verdicts that matter (unauthenticated / authorized / logon-
+  required / logon-failed / not-authorized / not-found) and the `RFC_SYSTEM_INFO` result
+  record. Full parameter/ITAB deserialisation for arbitrary functions is not implemented.
 - The 80-byte APPC header constants were derived against kernel 7.93; other kernels may
   differ.
 
